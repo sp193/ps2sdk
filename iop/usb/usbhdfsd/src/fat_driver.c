@@ -21,6 +21,7 @@
 #include "scache.h"
 #include "fat_driver.h"
 #include "fat.h"
+#include "ucs2.h"
 #include "mass_stor.h"
 
 //#define DEBUG  //comment out this line when not debugging
@@ -343,7 +344,6 @@ static int fat_getPartitionBootSector(mass_dev* dev, unsigned int sector, fat_bp
 */
 int fat_getDirentry(unsigned char fatType, fat_direntry* dir_entry, fat_direntry_summary* dir ) {
 	int i, j;
-	unsigned int offset;
 	unsigned char cont;
 	u16 character;
 
@@ -359,52 +359,47 @@ int fat_getDirentry(unsigned char fatType, fat_direntry* dir_entry, fat_direntry
 	//detect long filename
 	if (dir_entry->lfn.rshv == 0x0F && dir_entry->lfn.reserved1 == 0x00 && dir_entry->lfn.reserved2[0] == 0x00) {
 		//long filename - almost whole direntry is unicode string - extract it
-		offset = dir_entry->lfn.entrySeq & 0x3f;
-		offset--;
-		offset = offset * 13;
 		//name - 1st part
 		cont = 1;
 		for (i = 0; i < 10 && cont; i+=2) {
 			character = dir_entry->lfn.name1[i] | (dir_entry->lfn.name1[i+1] << 8);
 
-			if (character == 0 || offset >= (FAT_MAX_NAME - 1)) {
-				dir->name[offset] = 0; //terminate
+			if (character == 0 || dir->namelen >= (FAT_MAX_NAME - 1)) {
+				dir->name[dir->namelen] = 0; //terminate
 				cont = 0; //stop
 			} else {
 				// Handle non-ASCII characters
-				dir->name[offset] = character < 128 ? dir_entry->lfn.name1[i] : '?';
-				offset++;
+				dir->namelen += ucs2ToUtf8(character, &dir->name[dir->namelen], FAT_MAX_NAME - 1 - dir->namelen);
 			}
 		}
 		//name - 2nd part
 		for (i = 0; i < 12 && cont; i+=2) {
 			character = dir_entry->lfn.name2[i] | (dir_entry->lfn.name2[i+1] << 8);
 
-			if (character == 0 || offset >= (FAT_MAX_NAME - 1)) {
-				dir->name[offset] = 0; //terminate
+			if (character == 0 || dir->namelen >= (FAT_MAX_NAME - 1)) {
+				dir->name[dir->namelen] = 0; //terminate
 				cont = 0; //stop
 			} else {
 				// Handle non-ASCII characters
-				dir->name[offset] = character < 128 ? dir_entry->lfn.name2[i] : '?';
-				offset++;
+				dir->namelen += ucs2ToUtf8(character, &dir->name[dir->namelen], FAT_MAX_NAME - 1 - dir->namelen);
 			}
 		}
 		//name - 3rd part
 		for (i = 0; i < 4 && cont; i+=2) {
 			character = dir_entry->lfn.name3[i] | (dir_entry->lfn.name3[i+1] << 8);
 
-			if (character == 0 || offset >= (FAT_MAX_NAME - 1)) {
-				dir->name[offset] = 0; //terminate
+			if (character == 0 || dir->namelen >= (FAT_MAX_NAME - 1)) {
+				dir->name[dir->namelen] = 0; //terminate
 				cont = 0; //stop
 			} else {
 				// Handle non-ASCII characters
-				dir->name[offset] = character < 128 ? dir_entry->lfn.name3[i] : '?';
-				offset++;
+				dir->namelen += ucs2ToUtf8(character, &dir->name[dir->namelen], FAT_MAX_NAME - 1 -  dir->namelen);
 			}
 		}
-		if ((dir_entry->lfn.entrySeq & 0x40)) { //terminate string flag
-			dir->name[offset] = 0;
-		}
+	/*	//Does not work for UTF-8, due to each character possibly not having the same size.
+		if ((dir_entry->lfn.entrySeq & 0x40)) { //Final segment flag
+			dir->name[dir->namelen] = 0;
+		} */
 		return 2;
 	} else {
 		//short filename
@@ -430,7 +425,7 @@ int fat_getDirentry(unsigned char fatType, fat_direntry* dir_entry, fat_direntry
 			}
 		}
 		dir->sname[i+j] = 0; //terminate
-		if (dir->name[0] == 0) { //long name desn't exit
+		if (dir->name[0] == 0) { //if long filename doesn't exist, copy the short filename.
 			for (i =0 ; dir->sname[i] !=0; i++) dir->name[i] = dir->sname[i];
 			dir->name[i] = 0;
 		}
@@ -609,6 +604,7 @@ static int fat_getDirentryStartCluster(fat_driver* fatd, char* dirName, unsigned
 	//clear name strings
 	dir.sname[0] = 0;
 	dir.name[0] = 0;
+	dir.namelen = 0;
 
 	ret = fat_getDirentrySectorData(fatd, startCluster, &startSector, &dirSector);
 	if (ret < 0)
@@ -638,7 +634,9 @@ static int fat_getDirentryStartCluster(fat_driver* fatd, char* dirName, unsigned
 		while (cont &&  dirPos < fatd->partBpb.sectorSize) {
 			fat_direntry* dir_entry = (fat_direntry*) (sbuf + dirPos);
 			cont = fat_getDirentry(fatd->partBpb.fatType, dir_entry, &dir); //get single directory entry from sector buffer
-			if (cont == 1) { //when short file name entry detected
+			if (cont == 1) { //when short file name entry detected (succeeds its LFN entries)
+				dir.name[dir.namelen] = '\0'; //NULL-terminate the long filename, since all parts have been gathered.
+
 				if (!(dir.attr & FAT_ATTR_VOLUME_LABEL)) { //not volume label
 					if ((strEqual(dir.sname, dirName) == 0) ||
 						(strEqual(dir.name, dirName) == 0) ) {
@@ -654,6 +652,7 @@ static int fat_getDirentryStartCluster(fat_driver* fatd, char* dirName, unsigned
 				//clear name strings
 				dir.sname[0] = 0;
 				dir.name[0] = 0;
+				dir.namelen = 0;
 			}//ends "if (cont == 1)"
 			dirPos += sizeof(fat_direntry);
 		}//ends "while"
@@ -903,6 +902,7 @@ int fat_getNextDirentry(fat_driver* fatd, fat_dir_list* fatdlist, fat_dir* fatDi
 	//clear name strings
 	dir.sname[0] = 0;
 	dir.name[0] = 0;
+	dir.namelen = 0;
 
 	ret = fat_getDirentrySectorData(fatd, &dirCluster, &startSector, &dirSector);
 	if (ret < 0)
@@ -936,7 +936,9 @@ int fat_getNextDirentry(fat_driver* fatd, fat_dir_list* fatdlist, fat_dir* fatDi
 			fat_direntry* dir_entry = (fat_direntry*) (sbuf + dirPos);
 			cont = fat_getDirentry(fatd->partBpb.fatType, dir_entry, &dir); //get a directory entry from sector
 			fatdlist->direntryIndex++; //Note current entry processed
-			if (cont == 1) { //when short file name entry detected
+			if (cont == 1) { //when short file name entry detected (succeeds its LFN entries)
+				dir.name[dir.namelen] = '\0'; //NULL-terminate the long filename, since all parts have been gathered.
+
 				fat_setFatDir(fatd, fatDir, dirCluster, &dir_entry->sfn, &dir, 0);
 #if 0
 			XPRINTF("USBHDFSD: fat_getNextDirentry %c%c%c%c%c%c %x %s %s\n",

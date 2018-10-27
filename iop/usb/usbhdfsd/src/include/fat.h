@@ -133,6 +133,7 @@ typedef union _fat_direntry {
 
 typedef struct _fat_direntry_summary {
 	unsigned char attr;		//Attributes (bits:5-Archive 4-Directory 3-Volume Label 2-System 1-Hidden 0-Read Only)
+	unsigned char namelen;		//Contains the length of the long filename.
 	char name[FAT_MAX_NAME];	//Long name (zero terminated)
 	char sname[13];			//Short name (zero terminated)
 	unsigned int  size;		//file size, 0 for directory

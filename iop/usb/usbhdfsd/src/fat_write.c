@@ -28,6 +28,7 @@
 #include "usbhd_common.h"
 #include "fat_driver.h"
 #include "fat.h"
+#include "ucs2.h"
 #include "scache.h"
 #include "mass_stor.h"
 
@@ -649,47 +650,56 @@ static unsigned char computeNameChecksum(const char* sname) {
 }
 
 //---------------------------------------------------------------------------
+static int setNameChar(const char **pLname, char *fnameCharOut, int endflag) {
+	int chlen;
+	unsigned short int wc;
+
+	if (!endflag) {
+		chlen = utf8ToUcs2(*pLname, &wc);
+		if (chlen == 0) {
+			//In case of encoding errors, null-terminate.
+			wc = '\0';
+		}
+
+		fnameCharOut[0] = wc & 0xFF;
+		fnameCharOut[1] = wc >> 8;
+
+		if (wc == '\0')
+			endflag = 1;
+		if (wc != '\0') //Do not increment past the NULL.
+			*pLname += chlen;
+	} else {
+		//End of filename.
+		fnameCharOut[0] = 0xFF;
+		fnameCharOut[1] = 0xFF;
+	}
+
+	return endflag;
+}
+
 /*
   fill the LFN (long filename) direntry
 */
-static void setLfnEntry(const char* lname, int nameSize, unsigned char chsum, fat_direntry_lfn* dlfn, int part, int maxPart){
-	int i,j;
-	unsigned char name[26]; //unicode name buffer = 13 characters per 2 bytes
-	int nameStart;
+static void setLfnEntry(const char** pLname, unsigned char chsum, fat_direntry_lfn* dlfn, int part, int maxPart){
+	int i, endflag;
 
-	nameStart = 13 * (part - 1);
-	j = nameSize - nameStart;
-	if (j > 13) {
-		j = 13;
-	}
+	endflag = 0;
 
-	//fake unicode conversion
-	for (i = 0; i < j; i++) {
-		name[i*2]   = (unsigned char)lname[nameStart + i];
-		name[i*2+1] = 0;
-	}
-
-	//rest of the name is zero terminated and padded with 0xFF
-	for (i = j; i < 13; i++) {
-		if (i == j) {
-			name[i*2]   = 0;
-			name[i*2+1] = 0;
-		} else {
-			name[i*2] = 0xFF;
-			name[i*2+1] = 0xFF;
-		}
-	}
-
+	//Translate the filename. If the end of the filename is found, null-terminate (0x00) and pad the remainder space with 0xFF.
 	dlfn->entrySeq = part;
 	if (maxPart == part)
-		dlfn->entrySeq |= 0x40;
+		dlfn->entrySeq |= 0x40; //Set last filename entry sequence flag.
 	dlfn->checksum = chsum;
+
 	//1st part of the name
-	for (i = 0; i < 10; i++) dlfn->name1[i] = name[i];
+	for (i = 0; i < 5; i++)
+		endflag = setNameChar(pLname, &dlfn->name1[i*2], endflag);
 	//2nd part of the name
-	for (i = 0; i < 12; i++) dlfn->name2[i] = name[i+10];
+	for (i = 0; i < 6; i++)
+		endflag = setNameChar(pLname, &dlfn->name2[i*2], endflag);
 	//3rd part of the name
-	for (i = 0; i < 4; i++) dlfn->name3[i] = name[i+22];
+	for (i = 0; i < 2; i++)
+		endflag = setNameChar(pLname, &dlfn->name3[i*2], endflag);
 	dlfn->rshv = 0x0f;
 	dlfn->reserved1 = 0;
 	dlfn->reserved2[0] = 0;
@@ -1108,6 +1118,7 @@ static int fat_fillDirentryInfo(fat_driver* fatd, const char* lname, const char*
 	//clear name strings
 	dir.sname[0] = 0;
 	dir.name[0] = 0;
+	dir.namelen = 0;
 
 	j = 0;
 	if (directory>0) directory = FAT_ATTR_DIRECTORY;
@@ -1141,7 +1152,9 @@ static int fat_fillDirentryInfo(fat_driver* fatd, const char* lname, const char*
 			mask_ix = j>>3;
 			mask_sh = j&7;
 			switch (cont) {
-				case 1: //short name
+				case 1: //short name (succeeds its LFN entries)
+					dir.name[dir.namelen] = '\0'; //NULL-terminate the long filename, since all parts have been gathered.
+
 					fatd->dir_used_mask[mask_ix] |= (1<<mask_sh);
 					if (!(dir.attr & FAT_ATTR_VOLUME_LABEL)) { //not volume label
 						if ((strEqual(dir.sname, lname) == 0) || (strEqual(dir.name, lname) == 0) ) {
@@ -1167,6 +1180,7 @@ static int fat_fillDirentryInfo(fat_driver* fatd, const char* lname, const char*
 						//clear name strings
 						dir.sname[0] = 0;
 						dir.name[0] = 0;
+						dir.namelen = 0;
 					}//ends "if(!(dir.attr & FAT_ATTR_VOLUME_LABEL))"
 					else { //dlanor: Volume label
 						fatd->deIdx = 0;
@@ -1397,15 +1411,15 @@ static int saveDirentry(fat_driver* fatd, unsigned int startCluster,
 	unsigned int dirPos;
 	int entryEndIndex;
 	int writeFlag;
+	const char *pLname;
 #ifdef DEBUG
 	mass_dev* mass_device = fatd->dev;
 #endif
 	int part = entrySize - 1;
-	int nameSize;
 	unsigned char chsum;
 
 	chsum = computeNameChecksum(sname);
-	nameSize = strlen(lname);
+	pLname = lname;
 
 	cont = 1;
 	//clear name strings
@@ -1445,7 +1459,7 @@ static int saveDirentry(fat_driver* fatd, unsigned int startCluster,
 					else
 						setSfnEntryFromOld(sname, &dir_entry->sfn, orig_dsfn);
 				}else
-					setLfnEntry(lname, nameSize, chsum, &dir_entry->lfn, part, entrySize - 1);
+					setLfnEntry(&pLname, chsum, &dir_entry->lfn, part, entrySize - 1);
 				part--;
 				writeFlag++;
 				//SFN is stored
